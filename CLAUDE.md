@@ -1,0 +1,423 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> **Project:** Sistem Inkubator Telur IoT + TinyML  
+> **Author:** Zainal Arifin · NIM 2022TI038 · Institut Teknologi Bisnis AAS Indonesia  
+> **Target publikasi:** Jurnal SINTA 2 · 2026
+
+---
+
+## Project Overview
+
+Firmware ESP32 untuk sistem inkubator telur otomatis dengan **5 mode operasi**, menggabungkan:
+- Sensor SHT31 (suhu/kelembapan) dengan kalibrasi offset
+- AC Dimmer + Fan sebagai aktuator
+- 1D-CNN TinyML untuk kontrol prediktif
+- Pipeline cloud: MQTT → InfluxDB → Grafana → FastAPI training
+
+### Arsitektur Sistem
+
+```
+[SHT31 + Door] → [ESP32 Multi-Mode Firmware] → [MQTT] → [VPS Oracle]
+                         ↓                                    ↓
+                  [AC Dimmer + Fan]              [InfluxDB → Grafana]
+                         ↑                                    ↓
+                  [model.cc OTA] ←←←← [FastAPI: Train 1D-CNN + Generate model.cc]
+```
+
+### Lima Mode Firmware (pilih via Rotary Encoder, disimpan ke NVS Flash)
+
+| Mode | Nama | Status |
+|------|------|--------|
+| Mode 0 | Data Logger (PRBS Excitation) | 🔲 Belum |
+| Mode 1 | On-Off Control (baseline) | 🔲 Belum |
+| Mode 2 | PID Control (baseline) | 🔲 Belum |
+| Mode 3 | 1D-CNN TinyML Predictive (target utama) | 🔲 Belum |
+| Mode 4 | Sensor Calibration Utility | ✅ Fase kalibrasi sudah ada di main.cpp |
+
+---
+
+## Build & Flash Commands
+
+Project menggunakan [PlatformIO](https://platformio.org/). Semua perintah asumsikan `pio` ada di PATH.
+
+```bash
+# Build only
+pio run
+
+# Build + upload ke ESP32
+pio run --target upload
+
+# Buka serial monitor (115200 baud)
+pio device monitor
+
+# Upload lalu langsung monitor
+pio run --target upload && pio device monitor
+
+# Clean build artifacts
+pio run --target clean
+
+# Jika auto-detect port gagal
+pio run --target upload --upload-port /dev/ttyUSB0
+pio device monitor --port /dev/ttyUSB0 --baud 115200
+```
+
+No test runner dikonfigurasi (`test/` masih scaffold kosong).
+
+---
+
+## Hardware
+
+| Komponen | Interface | Address/Pin |
+|----------|-----------|-------------|
+| ESP32 DevKit V1 | — | target board |
+| SHT31 (temp/humidity) | I2C SDA=21, SCL=22 | 0x44 (ADDR→GND) atau 0x45 (ADDR→VCC) |
+| LCD 16×2 | I2C (same bus) | 0x27, coba 0x3F jika blank |
+| AC Dimmer | Zero-cross=27, PWM=14 | — |
+| Fan relay | GPIO 26 | — |
+| Door sensor | GPIO 13 | — |
+| Rotary Encoder | CLK=25, DT=33, SW=32 | — |
+
+I2C berjalan di 100 kHz (`Wire.setClock(100000)`) untuk toleransi panjang kabel. I2C scanner otomatis berjalan saat boot — gunakan untuk debug address mismatch.
+
+---
+
+## Konfigurasi Pin
+
+```cpp
+// config.h
+#define PIN_SDA         21   // SHT31 + LCD I2C Data
+#define PIN_SCL         22   // SHT31 + LCD I2C Clock
+#define PIN_ZERO_CROSS  27   // AC Dimmer zero-crossing interrupt
+#define PIN_DIMMER_PWM  14   // AC Dimmer control output
+#define PIN_ENC_CLK     25   // Rotary encoder A
+#define PIN_ENC_DT      33   // Rotary encoder B
+#define PIN_ENC_SW      32   // Rotary encoder button
+#define PIN_FAN_RELAY   26   // Fan relay (reserved)
+#define PIN_DOOR_SENSOR 13   // Door sensor (reserved)
+
+#define SETPOINT_TEMP        38.0f
+#define SAMPLE_INTERVAL_MS   5000
+#define PRBS_PWM_LOW         25
+#define PRBS_PWM_HIGH        75
+```
+
+---
+
+## Struktur File Proyek
+
+```
+firmware/
+├── platformio.ini
+├── src/
+│   ├── main.cpp                   # Boot, mode manager, main loop
+│   ├── hal/
+│   │   ├── hal_sht31.cpp/h        # Driver SHT31 + kalibrasi offset dari NVS
+│   │   ├── hal_dimmer.cpp/h       # AC Light Dimmer PWM (zero-crossing)
+│   │   ├── hal_fan.cpp/h          # Fan relay GPIO 26
+│   │   ├── hal_door.cpp/h         # Door sensor GPIO 13
+│   │   └── hal_lcd.cpp/h          # LCD 16x2 I2C
+│   ├── modes/
+│   │   ├── mode_datalogger.cpp/h  # Mode 0: PRBS excitation + MQTT publish
+│   │   ├── mode_onoff.cpp/h       # Mode 1: On-Off control ±0.3°C hysteresis
+│   │   ├── mode_pid.cpp/h         # Mode 2: PID + tuning via MQTT
+│   │   ├── mode_tinyml.cpp/h      # Mode 3: 1D-CNN inference + proportional ctrl
+│   │   └── mode_calibration.cpp/h # Mode 4: Sensor calibration utility
+│   ├── ml/
+│   │   └── model.cc               # GENERATED — 1D-CNN TFLite model (inject via OTA)
+│   ├── comms/
+│   │   ├── mqtt_client.cpp/h      # MQTT publish/subscribe
+│   │   ├── ota_manager.cpp/h      # OTA update receiver (model.cc)
+│   │   └── ntp_sync.cpp/h         # NTP time sync
+│   └── config/
+│       ├── config.h               # Pin definitions, setpoint, MQTT topics
+│       └── nvs_manager.cpp/h      # Mode + offset save/load dari NVS Flash
+└── lib/
+    └── tflite-micro/              # TensorFlow Lite Micro library
+```
+
+---
+
+## Code Architecture
+
+### Firmware Saat Ini: Kalibrasi (`src/main.cpp`)
+
+State machine tiga state:
+```
+STATE_WARMING → STATE_UNSTABLE → STATE_STABLE
+```
+
+- **Ring buffer** `tempBuffer[WINDOW_SIZE=10]` — 10 sampel setiap 2 s = 20 s window
+- **Stability detection**: std dev window < `STABLE_THRESHOLD` (0.15°C) → `STATE_STABLE`
+- **Dual output**: LCD refresh 500 ms; Serial CSV setiap 2 s
+- **Serial CSV format**: `ms_since_boot,suhu_C,rh_pct,state,std_dev_C`
+  - Baris prefix `#` = pesan status, bukan data CSV
+
+Prosedur kalibrasi target tiga suhu waterbath: **35°C, 38°C, 40°C**. Offset = T_referensi − T_SHT31. Offset disimpan ke NVS Flash.
+
+### Key Constants
+
+| Constant | Default | Efek |
+|----------|---------|------|
+| `SAMPLE_INTERVAL_MS` | 5000 ms | Sensor read rate |
+| `WINDOW_SIZE` | 10 samples | Stability window |
+| `STABLE_THRESHOLD` | 0.15°C | Std-dev cutoff untuk STABLE |
+| `LCD_REFRESH_MS` | 500 ms | LCD update rate |
+| `SHT31_ADDR` | 0x44 | Ganti 0x45 jika ADDR pin ke VCC |
+| `LCD_ADDR` | 0x27 | Ganti 0x3F untuk beberapa modul |
+| `PRBS_PWM_LOW` | 25% | Level rendah PRBS excitation |
+| `PRBS_PWM_HIGH` | 75% | Level tinggi PRBS excitation |
+| `SETPOINT_TEMP` | 38.0°C | Target suhu inkubator |
+
+---
+
+## Mode 0: Data Logger (PALING KRITIS)
+
+**Wajib berjalan minimal 5 hari sebelum training CNN.**
+
+### Format CSV Data Logger
+
+Setiap 5 detik, satu baris CSV dikirim via MQTT ke InfluxDB:
+```
+timestamp_unix, suhu_in, suhu_ext, kelembapan, pwm_aktif, mode_eksitasi, door_status
+1748000000, 37.82, 29.45, 58.3, 65, "prbs", 0
+```
+
+### Skema Eksitasi PWM (4 sub-fase siklus)
+
+| Sub-fase | Durasi | Deskripsi |
+|----------|--------|-----------|
+| Steady-State Sweep | 2 jam | PWM: 20%→40%→60%→80%→60%→40%→20%, masing-masing 20 menit |
+| PRBS Excitation | 3 jam | Toggle antara 25%↔75%, periode random 30s–300s |
+| Disturbance Injection | 1 jam | Buka pintu 30s, drop PWM 0% 2 menit, spike 100% 1 menit |
+| Setpoint Tracking | 2 jam | On-Off di sekitar 38°C, semua data tetap direkam |
+
+### Target Dataset
+
+| Parameter | Target |
+|-----------|--------|
+| Durasi logging | 5–7 hari |
+| Interval sampling | 5 detik |
+| Total sampel minimum | 86.400 baris |
+| Split training | 70% train / 15% val / 15% test — **SEQUENTIAL** (jangan di-shuffle) |
+
+### Implementasi PRBS (LFSR 8-bit)
+
+```cpp
+class PRBSExcitation {
+  uint8_t lfsr = 0xAC;  // seed non-zero
+  uint8_t pwm_low = 25, pwm_high = 75;
+  uint32_t next_switch_ms;
+
+  uint8_t next_bit() {
+    uint8_t bit = ((lfsr >> 7) ^ (lfsr >> 5) ^ (lfsr >> 4) ^ (lfsr >> 3)) & 1;
+    lfsr = (lfsr << 1) | bit;
+    return bit;
+  }
+  uint32_t random_period_ms() {
+    uint16_t r = (lfsr * 17 + 43) % 271;
+    return (30 + r) * 1000UL;  // 30000ms – 300000ms
+  }
+public:
+  uint8_t get_pwm(uint32_t now_ms) {
+    if (now_ms >= next_switch_ms) {
+      next_switch_ms = now_ms + random_period_ms();
+      return next_bit() ? pwm_high : pwm_low;
+    }
+    return current_pwm;
+  }
+};
+```
+
+---
+
+## Mode 3: 1D-CNN TinyML
+
+### Arsitektur Model
+
+```python
+# Input: sliding window [60 timesteps × 3 features]
+# Features: [suhu_in_t, suhu_ext_t, pwm_aktif_t]
+# Output: prediksi suhu_in pada t+1 (5 detik ke depan)
+
+model = Sequential([
+    Conv1D(16, kernel_size=3, activation='relu', input_shape=(60, 3)),
+    MaxPooling1D(pool_size=2),
+    Conv1D(8, kernel_size=3, activation='relu'),
+    GlobalAveragePooling1D(),
+    Dense(16, activation='relu'),
+    Dense(1)  # T_pred
+])
+# Total param: ~713 | Float32: ~3KB | INT8: ~1KB | RAM inferensi: ~15-25KB
+```
+
+### Kontrol Proporsional Berbasis Prediksi
+
+```cpp
+// mode_tinyml.cpp
+float T_pred = model_infer(sliding_window);  // prediksi suhu 5 detik ke depan
+float error  = SETPOINT_TEMP - T_pred;       // error prediktif, bukan error saat ini
+float Kp     = 8.0f;                         // tuning empiris
+float pwm    = constrain(Kp * error, 0, 100);
+dimmer_set_pwm(pwm);
+```
+
+### Target Metrik Model
+
+| Metrik | Target |
+|--------|--------|
+| RMSE test set | < 0.3°C |
+| MAE test set | < 0.2°C |
+| Degradasi RMSE setelah INT8 | < 5% |
+| Ukuran model INT8 | < 5 KB |
+| RAM inferensi ESP32 | < 30 KB |
+| Latensi inferensi | < 5 ms |
+
+---
+
+## MQTT Topics
+
+```
+inkubator/telemetri    → publish: JSON data sensor setiap 5 detik
+inkubator/mode/set     ← subscribe: set mode dari dashboard
+inkubator/pid/params   ← subscribe: update Kp/Ki/Kd dari dashboard
+inkubator/ota/trigger  ← subscribe: trigger download model.cc baru
+inkubator/status       → publish: mode aktif, uptime, free heap
+```
+
+---
+
+## Alur OTA Model (Kritis untuk Mode 3)
+
+```
+1. Data logger ≥20.000 sampel terkumpul
+2. User trigger: POST /api/train via Grafana button
+3. FastAPI: InfluxDB → preprocess → train 1D-CNN
+4. Konversi: model.h5 → model.tflite → INT8 → model.cc
+5. FastAPI: simpan ke /models/latest/
+6. User approve: POST /api/ota/deploy
+7. FastAPI: publish MQTT ke inkubator/ota/trigger + URL download
+8. ESP32: download model.cc → simpan ke SPIFFS → restart
+9. ESP32 boot: load model dari SPIFFS → Mode 3 aktif
+```
+
+---
+
+## Target Latency
+
+| Komponen | Target |
+|----------|--------|
+| L_sensor (I2C SHT31) | < 10 ms |
+| L_inferensi (model.cc) | < 5 ms |
+| L_aktuasi (set PWM dimmer) | < 2 ms |
+| L_total | < 100 ms |
+| L_monitoring (ESP32 → Grafana) | < 5 detik |
+
+Ukur dengan `micros()`, 100 siklus.
+
+---
+
+## Config Files
+
+### `src/config/config.h`
+
+Berisi WiFi SSID/password dan MQTT broker address. **Belum di-`#include` oleh `main.cpp`** — disiapkan untuk fase cloud. File ini mengandung kredensial nyata — **tambahkan ke `.gitignore` sebelum push ke remote publik.**
+
+---
+
+## Aturan Penting (Jangan Dilanggar)
+
+1. **Mode 0 minimal 5 hari** sebelum training — jangan training dengan data < 20.000 sampel
+2. **Kalibrasi sensor SEBELUM data logging** — offset salah = dataset training rusak
+3. **Split data SEQUENTIAL, bukan random** — data time series tidak boleh di-shuffle
+4. **Simpan semua checkpoint model** — setiap model.cc yang di-deploy harus diberi versi
+5. **Uji firmware offline dulu** — pastikan semua mode stabil tanpa WiFi sebelum integrasi cloud
+6. **Latensi monitoring tidak kritis** — kontrol aktuator berjalan lokal di ESP32, tidak bergantung internet
+
+---
+
+## Progress Checklist
+
+> **Legend:** ✅ Kode ada dan substansial · ⚠️ Parsial/perlu dilengkapi · [ ] Belum dimulai
+
+### Fase 1 — HAL + Firmware Skeleton
+
+- [x] `hal_sht31.cpp`: baca suhu/RH, terapkan offset dari NVS ✅ (30 baris)
+- [x] `hal_dimmer.cpp`: PWM via zero-crossing (GPIO 27/14) ✅ (75 baris, ESP-IDF version-aware)
+- [x] `hal_fan.cpp`: relay on/off GPIO 26 ✅ (20 baris)
+- [x] `hal_door.cpp`: baca status pintu GPIO 13 ✅ (15 baris)
+- [x] `hal_lcd.cpp`: display mode + suhu + PWM ✅ (78 baris)
+- [x] `nvs_manager.cpp`: simpan/load mode aktif dan sensor offset ✅ (32 baris)
+- [x] `main.cpp`: rotary encoder → mode switching loop ✅ (239 baris, long-press confirm + NVS save)
+- [x] **Mode 0**: PRBS excitation + sub-fase siklus ✅ (161 baris) ⚠️ MQTT publish CSV belum terhubung
+- [x] **Mode 1**: On-Off control ±0.3°C hysteresis ✅ (55 baris)
+- [x] **Mode 4**: tampilkan suhu raw, simpan offset ke NVS ✅ (98 baris)
+- [ ] Uji offline (tanpa WiFi) — semua mode stabil
+- [ ] Uji MQTT publish ke broker lokal
+- [ ] LCD tampilkan mode, suhu, PWM dengan benar
+
+### Fase 2 — Cloud Stack (VPS Oracle)
+
+- [ ] Setup VPS: buka port 1883, 8883, 443, 80
+- [ ] `docker-compose.yml`: Mosquitto + InfluxDB + Grafana + FastAPI + Nginx
+- [ ] Mosquitto: uji koneksi dari ESP32
+- [ ] InfluxDB: bucket "inkubator", measurement "telemetri"
+- [ ] MQTT → InfluxDB bridge (Telegraf atau Python)
+- [ ] Grafana: dashboard suhu, kelembapan, PWM, mode
+- [ ] FastAPI: `/api/status`, `/api/train`, `/api/ota/deploy`
+- [ ] Nginx: TLS dengan Let's Encrypt
+- [ ] End-to-end: ESP32 → MQTT → InfluxDB → Grafana tampil
+
+### Fase 3 — PID + Kalibrasi
+
+- [x] **Mode 2**: skeleton `mode_pid.cpp` ada ✅ (82 baris) ⚠️ update Kp/Ki/Kd via MQTT belum
+- [ ] Tuning PID Ziegler-Nichols dari data real
+- [ ] **Mode 4** lengkap: kalibrasi 35°C, 38°C, 40°C
+- [ ] Rekam tabel kalibrasi (referensi vs SHT31 sebelum/sesudah)
+- [ ] Mulai **data logging Mode 0**: minimal 5 hari kontinu
+
+### Fase 4 — 1D-CNN TinyML
+
+- [ ] Export InfluxDB → CSV (≥20.000 baris)
+- [ ] Preprocessing: cleaning, normalisasi, sliding window [60,3]
+- [ ] Split sequential 70/15/15
+- [ ] Train 1D-CNN Keras, RMSE < 0.3°C
+- [ ] Kuantisasi INT8, verifikasi RMSE naik < 5%
+- [ ] Konversi ke `model.cc`
+- [ ] **Mode 3**: embed model.cc, uji inferensi pertama di ESP32
+- [ ] Bandingkan output ESP32 vs Python (toleransi < 0.1°C)
+- [ ] Ukur RAM: `ESP.getFreeHeap()` sebelum/sesudah inisialisasi model
+- [ ] Benchmark latensi: 100 siklus `micros()`
+- [ ] Uji alur OTA end-to-end
+
+### Fase 5 — Pengujian Komparatif & Paper
+
+- [ ] 4 skenario × 3 metode × 5 repetisi = 60 sesi uji
+- [ ] Skenario: cold start, disturbance (pintu 30s), env change ±3°C, steady state 2 jam
+- [ ] Metrik: Overshoot, Settling Time, Steady-State Error, Recovery Time
+- [ ] ANOVA one-way + post-hoc Tukey HSD
+- [ ] Grafik 300 DPI
+- [ ] Draft paper (template jurnal SINTA 2)
+- [ ] Similarity check < 20%
+- [ ] Submit jurnal
+
+---
+
+## Timeline
+
+| Minggu | Fase | Target |
+|--------|------|--------|
+| W1 | F1 awal | HAL semua komponen + Mode 0, 1, 4 |
+| W2 | F2 | Docker Compose VPS, MQTT-InfluxDB-Grafana hidup |
+| W3–W4 | F3 | Mode 2 PID, kalibrasi, mulai data logging 5 hari |
+| W5–W6 | F4 awal | Preprocessing, training 1D-CNN, konversi ke ESP32 |
+| W7 | F4 lanjutan | OTA pipeline, benchmark, Mode 3 stabil |
+| W8 | F5 awal | Pengujian komparatif 60 sesi |
+| W9 | F5 | Analisis statistik, grafik |
+| W10 | F5 | Penulisan paper, submit |
+
+---
+
+*Dokumen ini adalah panduan hidup — update setiap kali ada keputusan baru.*  
+*Zainal Arifin · 2022TI038 · Institut Teknologi Bisnis AAS Indonesia · 2026*
