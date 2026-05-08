@@ -3,7 +3,7 @@
 // Wi-Fi / MQTT credentials — DO NOT commit to public repo
 #define WIFI_SSID          "Jangan Lupa Sholat"
 #define WIFI_PASSWORD      "murahmeriahlho"
-#define MQTT_BROKER        "IP_ATAU_DOMAIN_VPS_ANDA"
+#define MQTT_BROKER        "mqtt.zeenarif.site"
 #define MQTT_PORT          1883
 #define MQTT_CLIENT_ID     "inkubator_esp32"
 
@@ -17,7 +17,8 @@
 // I2C
 #define PIN_SDA            21
 #define PIN_SCL            22
-#define SHT31_ADDR         0x44
+#define SHT31_ADDR         0x44   // Internal (ADDR pin → GND)
+#define SHT31_EXT_ADDR     0x45   // External (ADDR pin → VCC)
 #define LCD_ADDR           0x27
 
 // AC Dimmer (zero-crossing + TRIAC)

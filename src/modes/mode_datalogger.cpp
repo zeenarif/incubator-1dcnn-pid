@@ -4,6 +4,8 @@
 #include "../hal/hal_dimmer.h"
 #include "../hal/hal_door.h"
 #include "../config/config.h"
+#include "../comms/mqtt_client.h"
+#include "../comms/ntp_sync.h"
 #include <Arduino.h>
 #include <math.h>
 
@@ -55,6 +57,7 @@ static PRBSExcitation _prbs;
 static uint32_t _phase_start = 0;
 static uint32_t _last_ms     = 0;
 static float    _temp        = 0.0f;
+static float    _temp_ext    = 0.0f;
 static float    _rh          = 0.0f;
 static uint8_t  _pwm         = 0;
 static uint32_t _sample_cnt  = 0;
@@ -93,7 +96,7 @@ void mode_datalogger_init() {
 
     hal_lcd_mode_banner(0, "DATALOG");
     Serial.println(F("# Mode 0: Data Logger (PRBS Excitation)"));
-    Serial.println(F("# timestamp_ms,temp_C,rh_pct,pwm,phase,door"));
+    Serial.println(F("# timestamp_unix,temp_in_C,temp_ext_C,rh_pct,pwm,phase,door"));
 }
 
 void mode_datalogger_tick() {
@@ -105,11 +108,15 @@ void mode_datalogger_tick() {
 
     float t, h;
     if (!hal_sht31_read(&t, &h)) {
-        Serial.println(F("# WARN: read fail"));
+        Serial.println(F("# WARN: int sensor read fail"));
         return;
     }
     _temp = t;
     _rh   = h;
+
+    float t_ext, h_ext;
+    if (hal_sht31_read_ext(&t_ext, &h_ext)) _temp_ext = t_ext;
+
     _sub  = _current_sub(elapsed);
 
     switch (_sub) {
@@ -135,19 +142,23 @@ void mode_datalogger_tick() {
     hal_dimmer_set(_pwm);
     bool door = hal_door_is_open();
 
-    // LCD: top line = mode+phase, bottom = T+PWM
+    uint32_t ts = ntp_synced() ? ntp_timestamp() : 0;
+
+    // LCD: row0 = phase + sample count, row1 = t_in/t_ext + PWM
     {
         char row0[17], row1[17];
-        snprintf(row0, sizeof(row0), "M0:%s #%lu", _phase_names[_sub], _sample_cnt);
-        snprintf(row1, sizeof(row1), "T:%.2f P:%3d%%", _temp, _pwm);
+        snprintf(row0, sizeof(row0), "M0:%-6s #%05lu", _phase_names[_sub], _sample_cnt % 100000);
+        snprintf(row1, sizeof(row1), "%.1f/%.1f P:%3d%%", _temp, _temp_ext, _pwm);
         hal_lcd_row(0, row0);
         hal_lcd_row(1, row1);
     }
 
-    // Serial CSV
-    Serial.print(now);
+    // Serial CSV: timestamp_unix,temp_in_C,temp_ext_C,rh_pct,pwm,phase,door
+    Serial.print(ts);
     Serial.print(',');
     Serial.print(_temp, 2);
+    Serial.print(',');
+    Serial.print(_temp_ext, 2);
     Serial.print(',');
     Serial.print(_rh, 2);
     Serial.print(',');
@@ -156,6 +167,15 @@ void mode_datalogger_tick() {
     Serial.print(_phase_names[_sub]);
     Serial.print(',');
     Serial.println(door ? 1 : 0);
+
+    // MQTT publish JSON
+    if (mqtt_is_connected()) {
+        char payload[128];
+        snprintf(payload, sizeof(payload),
+            "{\"ts\":%lu,\"t_in\":%.2f,\"t_ext\":%.2f,\"rh\":%.1f,\"pwm\":%u,\"phase\":\"%s\",\"door\":%u}",
+            ts, _temp, _temp_ext, _rh, _pwm, _phase_names[_sub], (uint8_t)door);
+        mqtt_publish(TOPIC_TELEMETRI, payload);
+    }
 
     _sample_cnt++;
 }

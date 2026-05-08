@@ -157,9 +157,15 @@ void setup() {
         while (true) delay(1000);
     }
     hal_sht31_set_offset(temp_off, rh_off);
-    Serial.print(F("# SHT31 OK, offset="));
+    Serial.print(F("# SHT31 int OK, offset="));
     Serial.print(temp_off, 3);
     Serial.println(F("C"));
+
+    if (!hal_sht31_init_ext(SHT31_EXT_ADDR)) {
+        Serial.println(F("# WARN: SHT31 ext not found — t_ext will report 0"));
+    } else {
+        Serial.println(F("# SHT31 ext OK"));
+    }
 
     // Dimmer + Fan + Door
     hal_dimmer_init(PIN_ZERO_CROSS, PIN_DIMMER_PWM);
@@ -173,9 +179,8 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), _enc_isr, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  _sw_isr,  CHANGE);
 
-    // Cloud (non-blocking)
+    // Cloud (non-blocking) — mqtt_connect() di-skip saat setup, retry via mqtt_loop()
     mqtt_init(_on_mqtt);
-    mqtt_connect();
     ntp_init();
     ota_init();
 
