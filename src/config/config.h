@@ -67,3 +67,6 @@
 // NTP
 #define NTP_SERVER         "pool.ntp.org"
 #define NTP_UTC_OFFSET     25200   // WIB = UTC+7
+
+// Status publish interval
+#define STATUS_INTERVAL_MS 30000UL

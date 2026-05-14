@@ -30,11 +30,11 @@ Firmware ESP32 untuk sistem inkubator telur otomatis dengan **5 mode operasi**, 
 
 | Mode | Nama | Status |
 |------|------|--------|
-| Mode 0 | Data Logger (PRBS Excitation) | 🔲 Belum |
-| Mode 1 | On-Off Control (baseline) | 🔲 Belum |
-| Mode 2 | PID Control (baseline) | 🔲 Belum |
-| Mode 3 | 1D-CNN TinyML Predictive (target utama) | 🔲 Belum |
-| Mode 4 | Sensor Calibration Utility | ✅ Fase kalibrasi sudah ada di main.cpp |
+| Mode 0 | Data Logger (PRBS Excitation) | ✅ Berjalan, MQTT publish aktif, 5 hari data terkumpul |
+| Mode 1 | On-Off Control (baseline) | ✅ Kode ada (55 baris) |
+| Mode 2 | PID Control (baseline) | ⚠️ Skeleton ada (82 baris), belum tuning |
+| Mode 3 | 1D-CNN TinyML Predictive (target utama) | 🔲 Belum — menunggu model.cc |
+| Mode 4 | Sensor Calibration Utility | ✅ Ada di main.cpp |
 
 ---
 
@@ -111,19 +111,20 @@ I2C berjalan di 100 kHz (`Wire.setClock(100000)`) untuk toleransi panjang kabel.
 firmware/
 ├── platformio.ini
 ├── src/
-│   ├── main.cpp                   # Boot, mode manager, main loop
+│   ├── main.cpp                   # Boot, mode manager, status publish, MQTT handler
 │   ├── hal/
 │   │   ├── hal_sht31.cpp/h        # Driver SHT31 + kalibrasi offset dari NVS
 │   │   ├── hal_dimmer.cpp/h       # AC Light Dimmer PWM (zero-crossing)
 │   │   ├── hal_fan.cpp/h          # Fan relay GPIO 26
 │   │   ├── hal_door.cpp/h         # Door sensor GPIO 13
-│   │   └── hal_lcd.cpp/h          # LCD 16x2 I2C
+│   │   ├── hal_lcd.cpp/h          # LCD 16x2 I2C
+│   │   ├── hal_buzzer.cpp/h       # Active buzzer GPIO 4
 │   ├── modes/
 │   │   ├── mode_datalogger.cpp/h  # Mode 0: PRBS excitation + MQTT publish
-│   │   ├── mode_onoff.cpp/h       # Mode 1: On-Off control ±0.3°C hysteresis
-│   │   ├── mode_pid.cpp/h         # Mode 2: PID + tuning via MQTT
-│   │   ├── mode_tinyml.cpp/h      # Mode 3: 1D-CNN inference + proportional ctrl
-│   │   └── mode_calibration.cpp/h # Mode 4: Sensor calibration utility
+│   │   ├── mode_onoff.cpp/h       # Mode 1: On-Off ±0.3°C + MQTT + session support
+│   │   ├── mode_pid.cpp/h         # Mode 2: PID + MQTT params + MQTT publish
+│   │   ├── mode_tinyml.cpp/h      # Mode 3: 1D-CNN inference + MQTT publish
+│   │   └── mode_calibration.cpp/h # Mode 4: Sensor calibration (Serial only)
 │   ├── ml/
 │   │   └── model.cc               # GENERATED — 1D-CNN TFLite model (inject via OTA)
 │   ├── comms/
@@ -131,38 +132,41 @@ firmware/
 │   │   ├── ota_manager.cpp/h      # OTA update receiver (model.cc)
 │   │   └── ntp_sync.cpp/h         # NTP time sync
 │   └── config/
-│       ├── config.h               # Pin definitions, setpoint, MQTT topics
+│       ├── config.h               # Pin definitions, setpoint, MQTT topics, intervals
 │       └── nvs_manager.cpp/h      # Mode + offset save/load dari NVS Flash
-└── lib/
-    └── tflite-micro/              # TensorFlow Lite Micro library
+├── lib/
+│   └── tflite-micro/              # TensorFlow Lite Micro library
+└── docs/
+    ├── panduan_mode0_datalogger.md       # SOP menjalankan Mode 0
+    ├── panduan_langkah_selanjutnya.md    # Checklist fase setelah data logger selesai
+    └── referensi_payload_mqtt.md         # Format JSON semua topic MQTT + konfigurasi Telegraf/Grafana
 ```
 
 ---
 
 ## Code Architecture
 
-### Firmware Saat Ini: Kalibrasi (`src/main.cpp`)
+### Arsitektur Firmware Multi-Mode (`src/main.cpp`)
 
-State machine tiga state:
-```
-STATE_WARMING → STATE_UNSTABLE → STATE_STABLE
-```
+Loop utama mengelola 5 mode via rotary encoder. Mode tersimpan di NVS Flash — bertahan setelah reboot.
 
-- **Ring buffer** `tempBuffer[WINDOW_SIZE=10]` — 10 sampel setiap 2 s = 20 s window
-- **Stability detection**: std dev window < `STABLE_THRESHOLD` (0.15°C) → `STATE_STABLE`
-- **Dual output**: LCD refresh 500 ms; Serial CSV setiap 2 s
-- **Serial CSV format**: `ms_since_boot,suhu_C,rh_pct,state,std_dev_C`
-  - Baris prefix `#` = pesan status, bukan data CSV
+- **Mode switch**: rotate encoder → pilih mode → long-press SW ≥2 detik → konfirmasi + buzzer beep
+- **MQTT handler** (`_on_mqtt`): terima `inkubator/mode/set`, `inkubator/pid/params`, `inkubator/ota/trigger`
+- **Status publish**: setiap 30 detik kirim `inkubator/status` berisi mode, uptime, free_heap, wifi_rssi
+- **Semua mode publish ke** `inkubator/telemetri` dengan field `ctrl_mode` sebagai pembeda
 
-Prosedur kalibrasi target tiga suhu waterbath: **35°C, 38°C, 40°C**. Offset = T_referensi − T_SHT31. Offset disimpan ke NVS Flash.
+Payload tiap mode mengandung field `session_id` dan `scenario` (settable via `mode_X_set_session()`) untuk kebutuhan pelabelan data Phase 5.
+
+Mode 4 (Kalibrasi) menggunakan ring buffer 10 sampel, stability detection std dev < 0.15°C, output ke Serial CSV saja — tidak publish MQTT.
 
 ### Key Constants
 
 | Constant | Default | Efek |
 |----------|---------|------|
-| `SAMPLE_INTERVAL_MS` | 5000 ms | Sensor read rate |
-| `WINDOW_SIZE` | 10 samples | Stability window |
-| `STABLE_THRESHOLD` | 0.15°C | Std-dev cutoff untuk STABLE |
+| `SAMPLE_INTERVAL_MS` | 5000 ms | Sensor read rate (Mode 0–3) |
+| `STATUS_INTERVAL_MS` | 30000 ms | Heartbeat publish ke `inkubator/status` |
+| `WINDOW_SIZE` | 10 samples | Stability window (Mode 4 calibration) |
+| `STABLE_THRESHOLD` | 0.15°C | Std-dev cutoff untuk STABLE (Mode 4) |
 | `LCD_REFRESH_MS` | 500 ms | LCD update rate |
 | `SHT31_ADDR` | 0x44 | Ganti 0x45 jika ADDR pin ke VCC |
 | `LCD_ADDR` | 0x27 | Ganti 0x3F untuk beberapa modul |
@@ -279,12 +283,14 @@ dimmer_set_pwm(pwm);
 ## MQTT Topics
 
 ```
-inkubator/telemetri    → publish: JSON data sensor setiap 5 detik
-inkubator/mode/set     ← subscribe: set mode dari dashboard
-inkubator/pid/params   ← subscribe: update Kp/Ki/Kd dari dashboard
-inkubator/ota/trigger  ← subscribe: trigger download model.cc baru
-inkubator/status       → publish: mode aktif, uptime, free heap
+inkubator/telemetri    → publish: JSON data sensor setiap 5 detik (Mode 0–3)
+inkubator/status       → publish: mode, uptime, free_heap, wifi_rssi setiap 30 detik
+inkubator/mode/set     ← subscribe: set mode aktif (payload: "0"–"4")
+inkubator/pid/params   ← subscribe: update Kp/Ki/Kd (payload: "kp,ki,kd")
+inkubator/ota/trigger  ← subscribe: trigger OTA download model.cc (payload: URL)
 ```
+
+Lihat `docs/referensi_payload_mqtt.md` untuk format JSON lengkap setiap topic.
 
 ---
 
@@ -322,7 +328,7 @@ Ukur dengan `micros()`, 100 siklus.
 
 ### `src/config/config.h`
 
-Berisi WiFi SSID/password dan MQTT broker address. **Belum di-`#include` oleh `main.cpp`** — disiapkan untuk fase cloud. File ini mengandung kredensial nyata — **tambahkan ke `.gitignore` sebelum push ke remote publik.**
+Berisi WiFi SSID/password dan MQTT broker address. File ini **sudah di-`#include` oleh `main.cpp`**. Mengandung kredensial nyata — **pastikan sudah ada di `.gitignore` sebelum push ke remote publik.**
 
 ---
 
@@ -349,40 +355,42 @@ Berisi WiFi SSID/password dan MQTT broker address. **Belum di-`#include` oleh `m
 - [x] `hal_door.cpp`: baca status pintu GPIO 13 ✅ (15 baris)
 - [x] `hal_lcd.cpp`: display mode + suhu + PWM ✅ (78 baris)
 - [x] `nvs_manager.cpp`: simpan/load mode aktif dan sensor offset ✅ (32 baris)
-- [x] `main.cpp`: rotary encoder → mode switching loop ✅ (239 baris, long-press confirm + NVS save)
-- [x] **Mode 0**: PRBS excitation + sub-fase siklus ✅ (161 baris) ⚠️ MQTT publish CSV belum terhubung
-- [x] **Mode 1**: On-Off control ±0.3°C hysteresis ✅ (55 baris)
+- [x] `main.cpp`: rotary encoder → mode switching + status publish setiap 30 detik ✅ (276 baris)
+- [x] **Mode 0**: PRBS excitation + sub-fase siklus ✅, MQTT publish JSON + `ctrl_mode:"datalog"` ✅
+- [x] **Mode 1**: On-Off ±0.3°C + MQTT publish + `session_id`/`scenario` support ✅ (83 baris)
+- [x] **Mode 2**: PID + MQTT publish (err, integral, kp/ki/kd) + `session_id`/`scenario` ✅ (109 baris)
 - [x] **Mode 4**: tampilkan suhu raw, simpan offset ke NVS ✅ (98 baris)
+- [x] MQTT publish ke broker — berhasil, data mengalir ke InfluxDB ✅
+- [x] `inkubator/status` heartbeat publish aktif (mode, uptime, free_heap, wifi_rssi) ✅
 - [ ] Uji offline (tanpa WiFi) — semua mode stabil
-- [ ] Uji MQTT publish ke broker lokal
 - [ ] LCD tampilkan mode, suhu, PWM dengan benar
 
 ### Fase 2 — Cloud Stack (VPS Oracle)
 
-- [ ] Setup VPS: buka port 1883, 8883, 443, 80
-- [ ] `docker-compose.yml`: Mosquitto + InfluxDB + Grafana + FastAPI + Nginx
-- [ ] Mosquitto: uji koneksi dari ESP32
-- [ ] InfluxDB: bucket "inkubator", measurement "telemetri"
-- [ ] MQTT → InfluxDB bridge (Telegraf atau Python)
-- [ ] Grafana: dashboard suhu, kelembapan, PWM, mode
+- [x] Setup VPS: buka port 1883, 8883, 443, 80 ✅
+- [x] `docker-compose.yml`: Mosquitto + InfluxDB + Grafana + FastAPI + Nginx ✅
+- [x] Mosquitto: uji koneksi dari ESP32 ✅
+- [x] InfluxDB: bucket "inkubator", measurement "telemetri" ✅
+- [x] MQTT → InfluxDB bridge ✅
+- [x] End-to-end: ESP32 → MQTT → InfluxDB → Grafana tampil ✅
+- [ ] Grafana: dashboard suhu, kelembapan, PWM, mode (status?)
 - [ ] FastAPI: `/api/status`, `/api/train`, `/api/ota/deploy`
 - [ ] Nginx: TLS dengan Let's Encrypt
-- [ ] End-to-end: ESP32 → MQTT → InfluxDB → Grafana tampil
 
 ### Fase 3 — PID + Kalibrasi
 
-- [x] **Mode 2**: skeleton `mode_pid.cpp` ada ✅ (82 baris) ⚠️ update Kp/Ki/Kd via MQTT belum
+- [x] **Mode 2**: PID lengkap ✅ — MQTT publish aktif, update Kp/Ki/Kd via `inkubator/pid/params` ✅
+- [x] **data logging Mode 0**: ✅ 5 hari data terkumpul (2026-05-14)
 - [ ] Tuning PID Ziegler-Nichols dari data real
 - [ ] **Mode 4** lengkap: kalibrasi 35°C, 38°C, 40°C
 - [ ] Rekam tabel kalibrasi (referensi vs SHT31 sebelum/sesudah)
-- [ ] Mulai **data logging Mode 0**: minimal 5 hari kontinu
 
 ### Fase 4 — 1D-CNN TinyML
 
-- [ ] Export InfluxDB → CSV (≥20.000 baris)
-- [ ] Preprocessing: cleaning, normalisasi, sliding window [60,3]
-- [ ] Split sequential 70/15/15
-- [ ] Train 1D-CNN Keras, RMSE < 0.3°C
+- [x] Export InfluxDB → CSV (≥20.000 baris) ✅
+- [x] Preprocessing: cleaning, normalisasi, sliding window [60,3] ✅ (sedang berjalan 2026-05-14)
+- [x] Split sequential 70/15/15 ✅
+- [ ] Train 1D-CNN Keras, RMSE < 0.3°C (sedang berjalan)
 - [ ] Kuantisasi INT8, verifikasi RMSE naik < 5%
 - [ ] Konversi ke `model.cc`
 - [ ] **Mode 3**: embed model.cc, uji inferensi pertama di ESP32

@@ -218,9 +218,10 @@ void mode_datalogger_tick() {
 
     // MQTT publish JSON
     if (mqtt_is_connected()) {
-        char payload[128];
+        char payload[160];
         snprintf(payload, sizeof(payload),
-            "{\"ts\":%lu,\"t_in\":%.2f,\"t_ext\":%.2f,\"rh\":%.1f,\"pwm\":%u,\"phase\":\"%s\",\"door\":%u}",
+            "{\"ts\":%lu,\"t_in\":%.2f,\"t_ext\":%.2f,\"rh\":%.1f"
+            ",\"pwm\":%u,\"phase\":\"%s\",\"door\":%u,\"ctrl_mode\":\"datalog\"}",
             ts, _temp, _temp_ext, _rh, _pwm, _phase_names[_sub], (uint8_t)door);
         mqtt_publish(TOPIC_TELEMETRI, payload);
     }

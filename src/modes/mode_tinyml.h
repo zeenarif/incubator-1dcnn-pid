@@ -2,5 +2,5 @@
 
 void mode_tinyml_init();
 void mode_tinyml_tick();
-// Returns true if real model is loaded, false if using stub
 bool mode_tinyml_model_ready();
+void mode_tinyml_set_session(const char *session_id, const char *scenario);

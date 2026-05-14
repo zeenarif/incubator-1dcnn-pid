@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
 
 #include "config/config.h"
 #include "config/nvs_manager.h"
@@ -59,7 +60,9 @@ static uint8_t _pending_mode   = 4;
 static bool    _selecting      = false;
 static uint32_t _select_timeout = 0;
 
-static const char *MODE_NAMES[] = {"DATALOG","ON-OFF","PID","CNN","CALIB"};
+static const char *MODE_NAMES[]      = {"DATALOG","ON-OFF","PID","CNN","CALIB"};
+static const char *MODE_CTRL_NAMES[] = {"datalog","onoff","pid","tinyml","calib"};
+static uint32_t    _last_status_ms   = 0;
 
 static void _mode_init(uint8_t m) {
     switch (m) {
@@ -253,4 +256,21 @@ void loop() {
 
     // ── MQTT keep-alive ──────────────────────────────────────────────────────
     mqtt_loop();
+
+    // ── Periodic status publish (every STATUS_INTERVAL_MS) ──────────────────
+    if (mqtt_is_connected() && millis() - _last_status_ms >= STATUS_INTERVAL_MS) {
+        _last_status_ms = millis();
+        uint32_t ts = ntp_synced() ? ntp_timestamp() : 0;
+        char status_payload[128];
+        snprintf(status_payload, sizeof(status_payload),
+            "{\"ts\":%lu,\"uptime\":%lu,\"mode\":%u,\"mode_name\":\"%s\""
+            ",\"free_heap\":%lu,\"wifi_rssi\":%d}",
+            ts,
+            millis() / 1000UL,
+            _active_mode,
+            MODE_CTRL_NAMES[_active_mode],
+            (uint32_t)ESP.getFreeHeap(),
+            WiFi.RSSI());
+        mqtt_publish(TOPIC_STATUS, status_payload);
+    }
 }
