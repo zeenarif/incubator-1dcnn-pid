@@ -28,6 +28,7 @@
 // Actuators
 #define PIN_FAN_RELAY      26
 #define PIN_DOOR_SENSOR    13
+#define PIN_BUZZER          4   // Active buzzer (3.3V direct, GPIO4 → Buzzer+ → Buzzer− → GND)
 
 // Rotary Encoder
 #define PIN_ENC_CLK        25

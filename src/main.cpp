@@ -9,7 +9,7 @@
 //  Mode 4: Sensor Calibration Utility
 //
 //  Mode selection: Rotary encoder rotate → cycle modes
-//                  Long press SW (>1s) → confirm + save to NVS
+//                  Long press SW (≥2s) → beep + confirm + save to NVS
 // ============================================================
 
 #include <Arduino.h>
@@ -23,6 +23,7 @@
 #include "hal/hal_fan.h"
 #include "hal/hal_door.h"
 #include "hal/hal_lcd.h"
+#include "hal/hal_buzzer.h"
 
 #include "modes/mode_datalogger.h"
 #include "modes/mode_onoff.h"
@@ -35,21 +36,20 @@
 #include "comms/ota_manager.h"
 
 // ─── Rotary encoder state ────────────────────────────────────────────────────
-static volatile int  _enc_delta   = 0;
-static volatile bool _sw_pressed  = false;
-static volatile uint32_t _sw_down_ms = 0;
+static volatile int      _enc_delta        = 0;
+static volatile uint32_t _sw_down_ms       = 0;
+static volatile bool     _sw_long_fired    = false;  // cleared on each new press
 
 static void IRAM_ATTR _enc_isr() {
     int dt = digitalRead(PIN_ENC_DT);
     _enc_delta += (dt == HIGH) ? 1 : -1;
 }
 
+// ISR only captures press timestamp; 2 s threshold is checked in loop()
 static void IRAM_ATTR _sw_isr() {
     if (digitalRead(PIN_ENC_SW) == LOW) {
-        _sw_down_ms = millis();
-        _sw_pressed = false;
-    } else {
-        if (millis() - _sw_down_ms >= 1000) _sw_pressed = true;
+        _sw_down_ms    = millis();
+        _sw_long_fired = false;
     }
 }
 
@@ -177,7 +177,10 @@ void setup() {
     pinMode(PIN_ENC_DT,  INPUT_PULLUP);
     pinMode(PIN_ENC_SW,  INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), _enc_isr, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  _sw_isr,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  _sw_isr,  FALLING);
+
+    // Buzzer
+    hal_buzzer_init(PIN_BUZZER);
 
     // Cloud (non-blocking) — mqtt_connect() di-skip saat setup, retry via mqtt_loop()
     mqtt_init(_on_mqtt);
@@ -215,22 +218,28 @@ void loop() {
         _pending_mode = _active_mode;
     }
 
-    // ── Long-press SW: confirm mode switch ──────────────────────────────────
-    bool sw;
-    noInterrupts();
-    sw = _sw_pressed;
-    _sw_pressed = false;
-    interrupts();
+    // ── Long-press SW (2 s): confirm mode switch + beep feedback ────────────
+    if (_selecting) {
+        noInterrupts();
+        bool    fired = _sw_long_fired;
+        uint32_t down = _sw_down_ms;
+        interrupts();
 
-    if (sw && _selecting) {
-        _selecting = false;
-        if (_pending_mode != _active_mode) {
-            hal_dimmer_set(0);
-            _active_mode = _pending_mode;
-            nvs_save_mode(_active_mode);
-            Serial.print(F("# Mode switched to "));
-            Serial.println(_active_mode);
-            _mode_init(_active_mode);
+        if (!fired && digitalRead(PIN_ENC_SW) == LOW && millis() - down >= 2000) {
+            noInterrupts();
+            _sw_long_fired = true;
+            interrupts();
+
+            _selecting = false;
+            hal_buzzer_beep(500, 0, 1);   // single 500 ms "confirmed" beep
+            if (_pending_mode != _active_mode) {
+                hal_dimmer_set(0);
+                _active_mode = _pending_mode;
+                nvs_save_mode(_active_mode);
+                Serial.print(F("# Mode switched to "));
+                Serial.println(_active_mode);
+                _mode_init(_active_mode);
+            }
         }
     }
 
@@ -238,6 +247,9 @@ void loop() {
     if (!_selecting) {
         _mode_tick(_active_mode);
     }
+
+    // ── Buzzer pattern engine ────────────────────────────────────────────────
+    hal_buzzer_tick();
 
     // ── MQTT keep-alive ──────────────────────────────────────────────────────
     mqtt_loop();

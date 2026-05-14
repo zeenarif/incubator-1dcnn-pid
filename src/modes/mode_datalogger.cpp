@@ -3,6 +3,7 @@
 #include "../hal/hal_lcd.h"
 #include "../hal/hal_dimmer.h"
 #include "../hal/hal_door.h"
+#include "../hal/hal_buzzer.h"
 #include "../config/config.h"
 #include "../comms/mqtt_client.h"
 #include "../comms/ntp_sync.h"
@@ -68,14 +69,55 @@ static const char *_phase_names[] = {"SWEEP","PRBS","DISTURB","TRACK"};
 
 // ─── Disturbance sequence ─────────────────────────────────────────────────────
 // Within the 1h disturbance phase:
-//  0–30s   : door open event (physical action by user; we just record)
+//  0–30s   : door open event (physical action by user); buzzer beeps 500/500
+//  28–30s  : 2s warning beep (close door soon)
 //  30s–2.5m: PWM = 0
 //  2.5m–3.5m: PWM = 100 (spike)
 //  3.5m–60m: back to PRBS_LOW
+#define DISTURB_DOOR_WARN_MS  28000UL   // warn user 2 s before window closes
+#define DISTURB_DOOR_END_MS   30000UL   // door must be closed by here
+
 static uint8_t _disturb_pwm(uint32_t elapsed_ms) {
     if (elapsed_ms < 150000UL)   return 0;      // 2.5 min off
     if (elapsed_ms < 210000UL)   return 100;    // 1 min spike
     return PRBS_PWM_LOW;
+}
+
+// ─── DISTURB-phase buzzer state ───────────────────────────────────────────────
+static bool _db_beeping = false;   // alternating beep active
+static bool _db_warned  = false;   // 2 s warning already triggered
+
+static void _update_disturb_buzzer(SubPhase cur_sub, uint32_t elapsed) {
+    // Reset when outside DISTURB phase
+    if (cur_sub != PH_DISTURB) {
+        if (_db_beeping || _db_warned) {
+            hal_buzzer_stop();
+            _db_beeping = false;
+            _db_warned  = false;
+        }
+        return;
+    }
+
+    uint32_t d = elapsed - PHASE_SWEEP_MS - PHASE_PRBS_MS;
+
+    if (d < DISTURB_DOOR_WARN_MS) {
+        if (!_db_beeping) {
+            _db_beeping = true;
+            hal_buzzer_beep(500, 500, -1);  // infinite 500/500 until transition
+        }
+    } else if (d < DISTURB_DOOR_END_MS) {
+        if (!_db_warned) {
+            _db_warned  = true;
+            _db_beeping = false;
+            hal_buzzer_beep(2000, 0, 1);    // single 2 s closing-warning beep
+        }
+    } else {
+        if (_db_beeping) {
+            hal_buzzer_stop();
+            _db_beeping = false;
+        }
+        // _db_warned stays true; 2 s beep auto-ends via hal_buzzer_tick()
+    }
 }
 
 static SubPhase _current_sub(uint32_t elapsed) {
@@ -87,11 +129,14 @@ static SubPhase _current_sub(uint32_t elapsed) {
 
 void mode_datalogger_init() {
     hal_dimmer_set(0);
+    hal_buzzer_stop();
     _phase_start = millis();
     _last_ms     = millis();
     _sub         = PH_SWEEP;
     _pwm         = SWEEP_LEVELS[0];
     _sample_cnt  = 0;
+    _db_beeping  = false;
+    _db_warned   = false;
     _prbs.next_switch = millis();
 
     hal_lcd_mode_banner(0, "DATALOG");
@@ -102,6 +147,9 @@ void mode_datalogger_init() {
 void mode_datalogger_tick() {
     uint32_t now     = millis();
     uint32_t elapsed = (now - _phase_start) % PHASE_TOTAL_MS;
+
+    // Buzzer state machine runs every call — not rate-limited
+    _update_disturb_buzzer(_current_sub(elapsed), elapsed);
 
     if (now - _last_ms < SAMPLE_INTERVAL_MS) return;
     _last_ms = now;
