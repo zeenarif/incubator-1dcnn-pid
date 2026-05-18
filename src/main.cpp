@@ -31,6 +31,7 @@
 #include "modes/mode_pid.h"
 #include "modes/mode_tinyml.h"
 #include "modes/mode_calibration.h"
+#include "modes/mode_coldstart.h"
 
 #include "comms/mqtt_client.h"
 #include "comms/ntp_sync.h"
@@ -60,8 +61,8 @@ static uint8_t _pending_mode   = 4;
 static bool    _selecting      = false;
 static uint32_t _select_timeout = 0;
 
-static const char *MODE_NAMES[]      = {"DATALOG","ON-OFF","PID","CNN","CALIB"};
-static const char *MODE_CTRL_NAMES[] = {"datalog","onoff","pid","tinyml","calib"};
+static const char *MODE_NAMES[]      = {"DATALOG","ON-OFF","PID","CNN","CALIB","COLDLOG"};
+static const char *MODE_CTRL_NAMES[] = {"datalog","onoff","pid","tinyml","calib","coldstart"};
 static uint32_t    _last_status_ms   = 0;
 
 static void _mode_init(uint8_t m) {
@@ -71,6 +72,7 @@ static void _mode_init(uint8_t m) {
     case 2: mode_pid_init();         break;
     case 3: mode_tinyml_init();      break;
     case 4: mode_calibration_init(); break;
+    case 5: mode_coldstart_init();   break;
     }
 }
 
@@ -81,6 +83,7 @@ static void _mode_tick(uint8_t m) {
     case 2: mode_pid_tick();         break;
     case 3: mode_tinyml_tick();      break;
     case 4: mode_calibration_tick(); break;
+    case 5: mode_coldstart_tick();   break;
     }
 }
 
@@ -93,7 +96,7 @@ static void _on_mqtt(const char *topic, const uint8_t *payload, uint32_t len) {
 
     if (strcmp(topic, TOPIC_MODE_SET) == 0) {
         uint8_t m = (uint8_t)atoi(buf);
-        if (m <= 4) {
+        if (m <= 5) {
             hal_dimmer_set(0);
             _active_mode = m;
             nvs_save_mode(m);
@@ -211,7 +214,7 @@ void loop() {
             _pending_mode = _active_mode;
         }
         _select_timeout = millis() + 5000;
-        _pending_mode = (uint8_t)((_pending_mode + 5 + (delta > 0 ? 1 : -1)) % 5);
+        _pending_mode = (uint8_t)((_pending_mode + 6 + (delta > 0 ? 1 : -1)) % 6);
         _lcd_show_select(_pending_mode);
     }
 

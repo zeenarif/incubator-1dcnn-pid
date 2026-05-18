@@ -47,14 +47,26 @@
 #define ONOFF_HYSTERESIS   0.3f
 
 // Mode 2 – PID defaults
-#define PID_KP_DEFAULT     2.0f
-#define PID_KI_DEFAULT     0.1f
-#define PID_KD_DEFAULT     0.5f
+#define PID_KP_DEFAULT     72.0f
+#define PID_KI_DEFAULT     0.391f
+#define PID_KD_DEFAULT     0.0f
 
 // Mode 3 – 1D-CNN TinyML
 #define CNN_WINDOW_SIZE    60
 #define CNN_FEATURES       3
-#define CNN_KP             8.0f
+#define CNN_KP             18.0f
+#define CNN_KI              0.1f   // Ti = Kp/Ki = 180s
+#define CNN_I_CLAMP        65.0f  // anti-windup: 65 agar integral cukup mencapai setpoint 38°C
+                                   // (P_at_setpoint = −27%, butuh I ≥ 63% untuk PWM=36%)
+// Hysteresis CNN zone: CNN aktif hanya saat t_in cukup dekat setpoint (Bug 2 fix)
+// Masuk CNN  : t_in naik ke >= CNN_ZONE_ENTER (37.0°C) — model akurat di range ini
+// Keluar CNN : t_in turun ke <  CNN_ZONE_EXIT  (36.5°C) — kembali ke fallback
+// Band 0.5°C mencegah chattering di batas threshold
+#define CNN_ZONE_ENTER_TEMP 37.0f
+#define CNN_ZONE_EXIT_TEMP  36.5f
+// Fallback P-control saat di luar CNN zone
+#define CNN_FB_GAIN        30.0f
+#define CNN_FB_PWM_MIN     40.0f
 
 // Mode 4 – Calibration
 #define CALIB_WINDOW       10

@@ -4,6 +4,7 @@
 #include "../hal/hal_dimmer.h"
 #include "../hal/hal_door.h"
 #include "../config/config.h"
+#include "../config/nvs_manager.h"
 #include "../comms/mqtt_client.h"
 #include "../comms/ntp_sync.h"
 #include <Arduino.h>
@@ -27,6 +28,7 @@ void mode_pid_set_session(const char *session_id, const char *scenario) {
 }
 
 void mode_pid_init() {
+    nvs_load_pid(&_kp, &_ki, &_kd);
     hal_dimmer_set(0);
     _integral  = 0.0f;
     _prev_err  = 0.0f;
@@ -35,7 +37,7 @@ void mode_pid_init() {
     hal_lcd_mode_banner(2, "PID");
 
     Serial.println(F("# Mode 2: PID Control"));
-    Serial.printf("# Kp=%.3f Ki=%.3f Kd=%.3f\n", _kp, _ki, _kd);
+    Serial.printf("# Kp=%.3f Ki=%.3f Kd=%.3f (loaded from NVS)\n", _kp, _ki, _kd);
     Serial.println(F("# ts,temp_in_C,temp_ext_C,rh_pct,pwm_pct,err,integral,door,ctrl_mode,session_id,scenario"));
 }
 
@@ -58,7 +60,7 @@ void mode_pid_tick() {
 
     float err = SETPOINT_TEMP - _temp;
     _integral += err * dt;
-    _integral  = constrain(_integral, -50.0f, 50.0f);  // anti-windup
+    _integral  = constrain(_integral, -150.0f, 150.0f);  // anti-windup
     float derivative = (err - _prev_err) / dt;
     _prev_err = err;
 
@@ -105,5 +107,6 @@ void mode_pid_set_params(float kp, float ki, float kd) {
     _ki       = ki;
     _kd       = kd;
     _integral = 0.0f;
-    Serial.printf("# PID params updated: Kp=%.3f Ki=%.3f Kd=%.3f\n", _kp, _ki, _kd);
+    nvs_save_pid(_kp, _ki, _kd);
+    Serial.printf("# PID params updated & saved: Kp=%.3f Ki=%.3f Kd=%.3f\n", _kp, _ki, _kd);
 }
